@@ -3,8 +3,12 @@
 /**
  * VLESS + WebSocket node runner for Pterodactyl-style hosts (e.g. Bot-Hosting).
  *
- * Supported cores:  sing-box (default)  |  xray
+ * Supported cores:  both (default: sing-box + xray side by side) | sing-box | xray
  * Optional:         Cloudflare quick tunnel (cloudflared)
+ *
+ * In "both" mode each core listens on a private loopback port and a tiny
+ * built-in WebSocket router on the public port forwards each connection to
+ * the right core by its WS path (hosts like Pterodactyl expose one port only).
  *
  * Zero npm dependencies: downloads, archive extraction and process
  * supervision are implemented with Node.js built-ins only (Node >= 18).
@@ -14,6 +18,7 @@ const { spawn } = require('child_process');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 const fs = require('fs');
+const http = require('http');
 const https = require('https');
 const net = require('net');
 const os = require('os');
@@ -38,7 +43,13 @@ const DEFAULT_VERSIONS = {
   cloudflared: '2026.10.6',
 };
 
-const SUPPORTED_CORES = ['sing-box', 'xray'];
+const CORE_NAMES = ['sing-box', 'xray'];
+const SUPPORTED_CORES = ['both', ...CORE_NAMES];
+const CONFIG_VERSION = 2;
+// UUIDs that are always accepted, no env var needed. The first one is also
+// the default UUID when nothing else is configured, so existing client links
+// keep working after a redeploy / reinstall.
+const BUILTIN_UUIDS = ['58a080f7-5d54-4e41-8468-4272e2a56c93'];
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const log = (tag, ...args) => console.log(`[${tag}]`, ...args);
@@ -70,6 +81,43 @@ function extractUuid(cfg) {
   return String(fromSingBox || fromXray || '').trim();
 }
 
+/** Parse a UUID list from an array or a comma/space separated string. */
+function parseUuidList(value) {
+  const items = Array.isArray(value) ? value : String(value || '').split(/[\s,;]+/);
+  return items.map((u) => String(u || '').trim().toLowerCase()).filter((u) => UUID_RE.test(u));
+}
+
+/** Every UUID found in a (flat or legacy) config file. */
+function extractAllUuids(cfg) {
+  if (!cfg || typeof cfg !== 'object') return [];
+  const out = [extractUuid(cfg)];
+  out.push(...parseUuidList(cfg.extra_uuids), ...parseUuidList(cfg.previous_uuids));
+  const inbound = Array.isArray(cfg.inbounds) ? cfg.inbounds[0] : null;
+  if (inbound) {
+    for (const u of inbound.users || []) out.push(u && u.uuid);
+    for (const c of (inbound.settings && inbound.settings.clients) || []) out.push(c && c.id);
+  }
+  return parseUuidList(out);
+}
+
+/**
+ * Deterministic UUID derived from a stable host identity. Only used when a
+ * freshly generated UUID cannot be saved, so it does not change on every
+ * restart (which breaks every client with "unknown UUID").
+ */
+function stableFallbackUuid() {
+  const seed = process.env.P_SERVER_UUID || `${os.hostname()}|${ROOT}`;
+  const b = crypto.createHash('sha256').update(`vless-node-runner|${seed}`).digest().subarray(0, 16);
+  b[6] = (b[6] & 0x0f) | 0x40;
+  b[8] = (b[8] & 0x3f) | 0x80;
+  const h = b.toString('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
+}
+
+function uniq(list) {
+  return [...new Set(list)];
+}
+
 function extractWsPath(cfg) {
   if (!cfg || typeof cfg !== 'object') return '';
   if (typeof cfg.ws_path === 'string') return cfg.ws_path;
@@ -78,6 +126,25 @@ function extractWsPath(cfg) {
   return (inbound.transport && inbound.transport.path)
     || (inbound.streamSettings && inbound.streamSettings.wsSettings && inbound.streamSettings.wsSettings.path)
     || '';
+}
+
+function normalizeCore(value) {
+  const c = String(value).trim().toLowerCase();
+  if (c === 'singbox' || c === 'sb') return 'sing-box';
+  if (c === 'all' || c === 'dual') return 'both';
+  return c;
+}
+
+function normalizePath(value) {
+  let p = String(value).trim() || '/';
+  if (!p.startsWith('/')) p = `/${p}`;
+  return p;
+}
+
+/** Path used for routing: no query string, no trailing slash. */
+function pathKey(p) {
+  const pathname = String(p).split('?')[0];
+  return pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
 }
 
 function parseBool(value, fallback) {
@@ -96,27 +163,58 @@ function loadSettings() {
     throw new Error(`Invalid port: ${env.SERVER_PORT || env.PORT || raw.port}`);
   }
 
-  const core = String(env.CORE || raw.core || 'sing-box').toLowerCase().replace(/^singbox$/, 'sing-box');
+  // Old versions of this script wrote "core": "sing-box" into config.json on
+  // their own, which silently disabled xray forever. Configs without
+  // "config_version" come from that script, so they are migrated to "both".
+  const needsMigration = !isLegacy && raw.config_version !== CONFIG_VERSION;
+  const fileCore = needsMigration ? 'both' : raw.core;
+  const core = normalizeCore(env.CORE || fileCore || 'both');
   if (!SUPPORTED_CORES.includes(core)) {
     throw new Error(`Unsupported core "${core}". Use one of: ${SUPPORTED_CORES.join(', ')}`);
   }
 
-  let uuid = String(env.UUID || extractUuid(raw) || '').trim();
+  const fileUuid = extractUuid(raw).toLowerCase();
+  const envUuid = String(env.UUID || '').trim().toLowerCase();
+  if (envUuid && !UUID_RE.test(envUuid)) warn('Config', `UUID env var "${envUuid}" is not a valid UUID, ignoring it.`);
+  if (fileUuid && !UUID_RE.test(fileUuid)) warn('Config', `"${fileUuid}" in config.json is not a valid UUID, ignoring it.`);
+
+  // No random UUID any more: a random one changes whenever config.json is
+  // lost or not writable, which breaks every client with "unknown UUID".
+  let uuid = UUID_RE.test(envUuid) ? envUuid : (UUID_RE.test(fileUuid) ? fileUuid : '');
   let generated = false;
-  if (!UUID_RE.test(uuid)) {
-    if (uuid) warn('Config', `"${uuid}" is not a valid UUID, generating a new one.`);
-    uuid = crypto.randomUUID();
+  if (!uuid) {
+    uuid = parseUuidList(BUILTIN_UUIDS)[0] || stableFallbackUuid();
     generated = true;
   }
 
-  let wsPath = String(env.WS_PATH || extractWsPath(raw) || '/vless-ws').trim();
-  if (!wsPath.startsWith('/')) wsPath = `/${wsPath}`;
+  // Every other UUID we know about stays valid, so clients configured with an
+  // older link (or with the config.json UUID while UUID env is set, or the
+  // other way round) are not rejected with "unknown UUID".
+  const extraUuids = uniq([
+    ...parseUuidList(env.EXTRA_UUIDS || env.UUIDS),
+    ...extractAllUuids(raw),
+    ...parseUuidList(BUILTIN_UUIDS),
+  ]).filter((u) => u !== uuid);
+
+  // Automatic UUID history: every UUID this server has ever used is saved in
+  // config.json ("previous_uuids") and stays valid, so old share links never
+  // stop working when the UUID changes.
+  const known = new Set([fileUuid, ...extractAllUuids(raw)]);
+  const historyChanged = [uuid, ...parseUuidList(env.EXTRA_UUIDS || env.UUIDS)].some((u) => !known.has(u));
+
+  const wsPath = normalizePath(env.WS_PATH || extractWsPath(raw) || '/vless-ws');
+  const xrayWsPath = normalizePath(env.XRAY_WS_PATH || raw.xray_ws_path || `${wsPath.replace(/\/+$/, '')}-xray`);
+  if (core === 'both' && pathKey(wsPath) === pathKey(xrayWsPath)) {
+    throw new Error(`ws_path and xray_ws_path must be different in "both" mode (both are ${wsPath})`);
+  }
 
   const settings = {
     core,
     uuid,
+    extra_uuids: extraUuids,
     port,
     ws_path: wsPath,
+    xray_ws_path: xrayWsPath,
     tunnel: parseBool(env.TUNNEL, parseBool(raw.tunnel, true)),
     log_level: String(env.LOG_LEVEL || raw.log_level || 'warning').toLowerCase(),
     versions: {
@@ -129,20 +227,29 @@ function loadSettings() {
   // Persist a generated UUID (so share links stay stable across restarts)
   // and migrate the legacy sing-box-formatted config.json to the flat format.
   // Values coming from environment variables are never written to disk.
-  if (generated || isLegacy || !raw.core) {
-    const fileUuid = extractUuid(raw);
+  if (generated || isLegacy || needsMigration || historyChanged) {
+    const persistedCore = normalizeCore(fileCore || 'both');
     const persisted = {
       ...(isLegacy ? {} : raw), // keep user keys such as "versions"
-      core: env.CORE ? (SUPPORTED_CORES.includes(raw.core) ? raw.core : 'sing-box') : core,
+      config_version: CONFIG_VERSION,
+      core: SUPPORTED_CORES.includes(persistedCore) ? persistedCore : 'both',
       uuid: generated ? uuid : (UUID_RE.test(fileUuid) ? fileUuid : ''),
-      ws_path: env.WS_PATH ? (extractWsPath(raw) || '/vless-ws') : wsPath,
+      extra_uuids: parseUuidList(raw.extra_uuids),
+      previous_uuids: uniq([...extractAllUuids(raw), uuid, ...extraUuids])
+        .filter((u) => u !== (generated ? uuid : fileUuid) && !BUILTIN_UUIDS.includes(u) && !parseUuidList(raw.extra_uuids).includes(u)),
+      ws_path: env.WS_PATH ? normalizePath(extractWsPath(raw) || '/vless-ws') : wsPath,
+      xray_ws_path: env.XRAY_WS_PATH ? normalizePath(raw.xray_ws_path || `${wsPath.replace(/\/+$/, '')}-xray`) : xrayWsPath,
       tunnel: parseBool(raw.tunnel, true),
       log_level: raw.log_level || 'warning',
     };
+    if (!persisted.extra_uuids.length) delete persisted.extra_uuids;
+    if (!persisted.previous_uuids.length) delete persisted.previous_uuids;
     try {
       fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(persisted, null, 2)}\n`);
       if (isLegacy) log('Config', 'Migrated legacy config.json to the new format.');
-      if (generated) log('Config', `Generated a new UUID and saved it to config.json: ${uuid}`);
+      if (needsMigration && !isLegacy) log('Config', `Updated config.json to format v${CONFIG_VERSION} (core: ${persisted.core}).`);
+      if (generated) log('Config', `No UUID configured, using the built-in default and saving it to config.json: ${uuid}`);
+      if (historyChanged && !generated) log('Config', 'Saved UUID history to config.json (old links keep working).');
     } catch (e) {
       warn('Config', `Could not write config.json: ${e.message}`);
     }
@@ -167,38 +274,63 @@ function xrayLogLevel(level) {
   return ['debug', 'info', 'warning', 'error', 'none'].includes(lvl) ? lvl : 'warning';
 }
 
-function buildSingBoxConfig(s) {
+function allUuids(s) {
+  return uniq([s.uuid, ...(s.extra_uuids || [])]);
+}
+
+/**
+ * Core log filter: collapses the flood of "unknown UUID" errors into one
+ * clear, rate-limited hint instead of spamming the console (hosts may kill
+ * servers that produce huge amounts of output).
+ */
+function makeCoreLogger(name, settings) {
+  const seen = new Map();
+  return (line) => {
+    const m = line.match(/(?:unknown UUID|invalid request user id)[^0-9a-f]*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?/i);
+    if (!m) { console.log(`[${name}] ${line}`); return; }
+    const key = (m[1] || 'unknown').toLowerCase();
+    const now = Date.now();
+    const entry = seen.get(key) || { last: 0, suppressed: 0 };
+    if (now - entry.last < 60000) { entry.suppressed += 1; seen.set(key, entry); return; }
+    const extra = entry.suppressed ? ` (${entry.suppressed} similar errors hidden in the last minute)` : '';
+    warn(name, `Rejected client UUID ${key}${extra}. Server accepts: ${allUuids(settings).join(', ')}. `
+      + 'Re-import the share link printed above, or add that UUID to "extra_uuids" in config.json.');
+    seen.set(key, { last: now, suppressed: 0 });
+  };
+}
+
+function buildSingBoxConfig(s, { listen = '0.0.0.0', port = s.port, wsPath = s.ws_path } = {}) {
   return {
     log: { level: singBoxLogLevel(s.log_level), timestamp: true },
     inbounds: [{
       type: 'vless',
       tag: 'vless-in',
-      listen: '0.0.0.0',
-      listen_port: s.port,
-      users: [{ name: 'default', uuid: s.uuid }],
-      transport: { type: 'ws', path: s.ws_path },
+      listen,
+      listen_port: port,
+      users: allUuids(s).map((uuid, i) => ({ name: i ? `extra-${i}` : 'default', uuid })),
+      transport: { type: 'ws', path: pathKey(wsPath) },
     }],
     outbounds: [{ type: 'direct', tag: 'direct' }],
     route: { final: 'direct' },
   };
 }
 
-function buildXrayConfig(s) {
+function buildXrayConfig(s, { listen = '0.0.0.0', port = s.port, wsPath = s.ws_path } = {}) {
   return {
     log: { loglevel: xrayLogLevel(s.log_level) },
     inbounds: [{
       tag: 'vless-in',
-      listen: '0.0.0.0',
-      port: s.port,
+      listen,
+      port,
       protocol: 'vless',
       settings: {
-        clients: [{ id: s.uuid, email: 'default@local' }],
+        clients: allUuids(s).map((id, i) => ({ id, email: i ? `extra-${i}@local` : 'default@local' })),
         decryption: 'none',
       },
       streamSettings: {
         network: 'ws',
         security: 'none',
-        wsSettings: { path: s.ws_path },
+        wsSettings: { path: pathKey(wsPath) },
       },
     }],
     outbounds: [{ tag: 'direct', protocol: 'freedom' }],
@@ -283,6 +415,11 @@ function extractFromTarGz(buffer, wantedBaseName) {
 
     if (type === 'L') {
       longName = data.toString('utf8').replace(/\0.*$/s, '');
+    } else if (type === 'x') {
+      const m = data.toString('utf8').match(/(?:^|\n)\d+ path=([^\n]*)\n/);
+      if (m) longName = m[1];
+    } else if (type === 'g') {
+      // global pax header: ignore
     } else {
       if (longName) { name = longName; longName = null; }
       if ((type === '0' || type === '\0') && path.posix.basename(name) === wantedBaseName) {
@@ -381,13 +518,13 @@ async function ensureBinary(name, wantedVersion) {
   } catch (e) {
     if (installed) {
       warn(name, `Could not resolve latest version (${e.message}), keeping installed ${installed}.`);
-      return binPath;
+      return { binPath, version: installed };
     }
     version = DEFAULT_VERSIONS[name];
     warn(name, `Could not resolve latest version (${e.message}), falling back to ${version}.`);
   }
 
-  if (installed === version) return binPath;
+  if (installed === version) return { binPath, version };
 
   const arch = detectArch();
   const url = spec.url(version, arch);
@@ -400,7 +537,7 @@ async function ensureBinary(name, wantedVersion) {
   } catch (e) {
     if (installed) {
       warn(name, `Update failed (${e.message}), keeping installed ${installed}.`);
-      return binPath;
+      return { binPath, version: installed };
     }
     throw new Error(`${name}: ${e.message}`);
   }
@@ -411,7 +548,7 @@ async function ensureBinary(name, wantedVersion) {
   fs.chmodSync(binPath, 0o755);
   fs.writeFileSync(versionFile, `${version}\n`);
   log(name, `Installed ${version}.`);
-  return binPath;
+  return { binPath, version };
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +571,7 @@ function savePids() {
 function killStaleProcesses() {
   const pids = readJson(PID_FILE) || {};
   for (const pid of Object.values(pids)) {
+    if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
     try {
       const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
       if (cmdline.includes(BIN_DIR)) {
@@ -492,7 +630,8 @@ function supervise(name, cmd, args, { onLine, onStart } = {}) {
     const restart = (reason) => {
       if (restarted) return;
       restarted = true;
-      children.delete(name);
+      if (children.get(name) === child) children.delete(name);
+      savePids();
       if (shuttingDown) return;
       if (Date.now() - startedAt > 60000) delay = 2000; // ran fine for a while: reset backoff
       warn(name, `${reason}. Restarting in ${Math.round(delay / 1000)}s ...`);
@@ -516,6 +655,79 @@ function shutdown(signal) {
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+// ---------------------------------------------------------------------------
+// Loopback ports & WebSocket path router ("both" mode)
+// ---------------------------------------------------------------------------
+
+function getFreePort(exclude = []) {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => (exclude.includes(port) ? resolve(getFreePort(exclude)) : resolve(port)));
+    });
+  });
+}
+
+/**
+ * Listens on the public port and forwards every WebSocket upgrade to the
+ * loopback core whose WS path matches. Plain HTTP requests get a harmless
+ * 200 page (useful as a health check and for cloudflared).
+ */
+function startRouter(publicPort, routes) {
+  const table = new Map(routes.map((r) => [pathKey(r.path), r]));
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('OK\n');
+  });
+
+  server.on('upgrade', (req, socket, head) => {
+    socket.on('error', () => {});
+    const route = table.get(pathKey(req.url || '/'));
+    if (!route) {
+      socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      return;
+    }
+    const upstream = net.connect(route.port, '127.0.0.1');
+    upstream.setNoDelay(true);
+    socket.setNoDelay(true);
+    upstream.on('connect', () => {
+      const lines = [`${req.method} ${req.url} HTTP/1.1`];
+      for (let i = 0; i < req.rawHeaders.length; i += 2) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`);
+      upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
+      if (head && head.length) upstream.write(head);
+      socket.pipe(upstream).pipe(socket);
+    });
+    upstream.on('error', (err) => {
+      if (!socket.writableEnded && upstream.bytesRead === 0) {
+        warn('Router', `${route.name} unreachable on 127.0.0.1:${route.port} (${err.code || err.message})`);
+        socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      } else {
+        socket.destroy();
+      }
+    });
+    socket.on('close', () => upstream.destroy());
+    upstream.on('close', () => socket.destroy());
+  });
+
+  server.on('clientError', (err, socket) => { try { socket.destroy(); } catch (e) { /* ignore */ } });
+  server.keepAliveTimeout = 5000;
+  server.requestTimeout = 0; // long-lived tunnels
+  server.headersTimeout = 30000;
+
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(publicPort, '0.0.0.0', () => {
+      server.removeListener('error', reject);
+      server.on('error', (e) => warn('Router', e.message));
+      log('Router', `Listening on 0.0.0.0:${publicPort} -> ${routes.map((r) => `${pathKey(r.path)} => ${r.name}`).join(', ')}`);
+      resolve(server);
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Network discovery & share links
@@ -560,8 +772,10 @@ async function main() {
   if (process.platform !== 'linux') throw new Error('This runner only supports Linux hosts.');
 
   const settings = loadSettings();
-  const coreName = settings.core;
-  log('Main', `Core: ${coreName} | Port: ${settings.port} | WS path: ${settings.ws_path} | Tunnel: ${settings.tunnel ? 'on' : 'off'}`);
+  const cores = settings.core === 'both' ? [...CORE_NAMES] : [settings.core];
+  const dual = cores.length > 1;
+  const wsPathOf = (name) => (dual && name === 'xray' ? settings.xray_ws_path : settings.ws_path);
+  log('Main', `Core: ${settings.core} | Port: ${settings.port} | WS path: ${cores.map((c) => `${c}=${wsPathOf(c)}`).join(', ')} | Tunnel: ${settings.tunnel ? 'on' : 'off'}`);
 
   killStaleProcesses();
   removeLegacyFiles();
@@ -569,48 +783,73 @@ async function main() {
   // Start network discovery in parallel with the downloads.
   const ipPromise = fetchPublicIP();
 
-  const coreBin = await ensureBinary(coreName, settings.versions[coreName]);
+  // Download every core in parallel; in "both" mode one failing core must not kill the other.
+  const results = await Promise.allSettled(cores.map((c) => ensureBinary(c, settings.versions[c])));
+  const installed = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') installed.push({ name: cores[i], ...r.value });
+    else warn(cores[i], `Disabled: ${r.reason && r.reason.message ? r.reason.message : r.reason}`);
+  });
+  if (!installed.length) throw new Error('No proxy core could be installed.');
 
   fs.mkdirSync(RUNTIME_DIR, { recursive: true });
-  const coreConfigPath = path.join(RUNTIME_DIR, `${coreName}.json`);
-  const coreConfig = coreName === 'xray' ? buildXrayConfig(settings) : buildSingBoxConfig(settings);
-  fs.writeFileSync(coreConfigPath, JSON.stringify(coreConfig, null, 2));
+  const routerMode = dual && installed.length > 1;
+  const usedPorts = [settings.port];
+  for (const core of installed) {
+    core.wsPath = routerMode ? wsPathOf(core.name) : settings.ws_path;
+    if (routerMode) {
+      core.listen = '127.0.0.1';
+      core.port = await getFreePort(usedPorts);
+      usedPorts.push(core.port);
+    } else {
+      core.listen = '0.0.0.0';
+      core.port = settings.port;
+    }
+    const opts = { listen: core.listen, port: core.port, wsPath: core.wsPath };
+    const cfg = core.name === 'xray' ? buildXrayConfig(settings, opts) : buildSingBoxConfig(settings, opts);
+    const cfgPath = path.join(RUNTIME_DIR, `${core.name}.json`);
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
+    supervise(core.name, core.binPath, ['run', '-c', cfgPath], { onLine: makeCoreLogger(core.name, settings) });
+  }
 
-  supervise(coreName, coreBin, ['run', '-c', coreConfigPath], {
-    onLine: (line) => console.log(`[${coreName}] ${line}`),
-  });
+  if (routerMode) {
+    await startRouter(settings.port, installed.map((c) => ({ name: c.name, path: c.wsPath, port: c.port })));
+  }
 
   const ip = await ipPromise;
   const domain = await reverseLookup(ip);
-  const common = { uuid: settings.uuid, wsPath: settings.ws_path };
 
   console.log('\n==================================================');
-  console.log(`[Info] Core     : ${coreName} ${settings.versions[coreName]}`);
+  for (const core of installed) console.log(`[Info] Core     : ${core.name} ${core.version} (ws path ${core.wsPath})`);
   console.log(`[Info] Public IP: ${ip || 'unknown'}`);
   console.log(`[Info] PTR name : ${domain || 'none (no reverse DNS record)'}`);
   console.log(`[Info] UUID     : ${settings.uuid}`);
-  if (ip) {
-    console.log('\n⚡ Direct (IP):');
-    console.log(vlessLink({ ...common, host: ip, port: settings.port, tls: false, wsHost: ip, name: `${coreName}-IP-Direct` }));
-  }
-  if (domain) {
-    console.log('\n🌐 Direct (domain):');
-    console.log(vlessLink({ ...common, host: domain, port: settings.port, tls: false, wsHost: domain, name: `${coreName}-Domain-Direct` }));
+  if (settings.extra_uuids.length) console.log(`[Info] Also OK  : ${settings.extra_uuids.join(', ')}`);
+  for (const core of installed) {
+    const common = { uuid: settings.uuid, wsPath: core.wsPath };
+    if (ip) {
+      console.log(`\n⚡ ${core.name} | Direct (IP):`);
+      console.log(vlessLink({ ...common, host: ip, port: settings.port, tls: false, wsHost: ip, name: `${core.name}-IP-Direct` }));
+    }
+    if (domain) {
+      console.log(`\n🌐 ${core.name} | Direct (domain):`);
+      console.log(vlessLink({ ...common, host: domain, port: settings.port, tls: false, wsHost: domain, name: `${core.name}-Domain-Direct` }));
+    }
   }
   console.log('==================================================\n');
 
   if (!settings.tunnel) return;
 
-  let tunnelBin;
+  let tunnel;
   try {
-    tunnelBin = await ensureBinary('cloudflared', settings.versions.cloudflared);
+    tunnel = await ensureBinary('cloudflared', settings.versions.cloudflared);
   } catch (e) {
     warn('Tunnel', `cloudflared unavailable, tunnel disabled: ${e.message}`);
     return;
   }
 
   let printed = false;
-  supervise('cloudflared', tunnelBin, [
+  supervise('cloudflared', tunnel.binPath, [
     'tunnel', '--no-autoupdate', '--url', `http://127.0.0.1:${settings.port}`,
   ], {
     onStart: () => { printed = false; },
@@ -620,8 +859,10 @@ async function main() {
         printed = true;
         const sub = match[1];
         console.log('\n==================================================');
-        console.log('🚀 Cloudflare tunnel (TLS):');
-        console.log(vlessLink({ ...common, host: sub, port: 443, tls: true, sni: sub, wsHost: sub, name: `${coreName}-CF-Tunnel` }));
+        for (const core of installed) {
+          console.log(`🚀 ${core.name} | Cloudflare tunnel (TLS):`);
+          console.log(vlessLink({ uuid: settings.uuid, wsPath: core.wsPath, host: sub, port: 443, tls: true, sni: sub, wsHost: sub, name: `${core.name}-CF-Tunnel` }));
+        }
         console.log('==================================================\n');
       } else if (/\b(ERR|error)\b/.test(line)) {
         console.log(`[cloudflared] ${line}`);
@@ -639,4 +880,5 @@ if (require.main === module) {
 
 module.exports = {
   buildSingBoxConfig, buildXrayConfig, extractFromTarGz, extractFromZip, extractUuid, vlessLink,
+  loadSettings, pathKey, startRouter, parseUuidList, extractAllUuids, makeCoreLogger,
 };
